@@ -1,0 +1,387 @@
+# ---
+# Playbook: Analyze AAP Workflow Job Failures
+#
+# Purpose:
+# This playbook is designed to be run after an Ansible Automation Platform (AAP)
+# workflow job has completed (or is in progress). Its primary goals are:
+#   1. Identify if any jobs within the specified workflow have failed.
+#   2. If failures are found, retrieve the standard output (stdout) of those failed jobs.
+#   3. Analyze the stdout to extract common Ansible error messages and summarize them.
+#   4. Set an overall outcome status (`wt_outcome`) which can be used by other systems
+#      (e.g., a ServiceNow callback) to understand the workflow's result.
+#   5. Provide a summary of failures that can be logged or passed to other tools.
+#
+# How it works with AAP:
+# - It expects the `tower_workflow_job_id` variable to be passed to it. This is
+#   automatically available if this playbook is part of an AAP Workflow, especially
+#   if it's a failure handler or a subsequent node in the workflow.
+# - It uses AAP's REST API to fetch information about the workflow and its constituent jobs.
+# - Authentication to the AAP API is handled using environment variables
+#   (TOWER_HOST, TOWER_USERNAME, TOWER_PASSWORD, TOWER_VERIFY_SSL) which are
+#   automatically populated by AAP when a 'Controller Credential' (or a credential
+#   of a type that provides these, like 'Ansible Tower') is associated with the
+#   Job Template running this playbook.
+#
+# Important Variables:
+# - tower_workflow_job_id: (Input) The ID of the AAP workflow job to analyze.
+# - wt_outcome: (Input/Output) A variable often used for integration with external systems
+#               like ServiceNow to indicate the status. This playbook will update it
+#               based on its findings. Expected input values might be 'SCHEDULED' or
+#               'IN_PROGRESS'. It will be set to 'FAILED' or 'COMPLETED'.
+#
+# Notes on `delegate_to: localhost` and `run_once: true`:
+# Most tasks in this playbook run on `localhost` (the AAP controller node where
+# this playbook is executed) and `run_once: true` because they are performing
+# API calls to AAP itself or manipulating facts that are global to this playbook's execution.
+# This avoids redundant operations if the playbook were (incorrectly) configured to
+# run against multiple hosts in an inventory.
+# ---
+
+- name: Get workflow job ID # TASK 1
+  # Purpose: Ensure the `tower_workflow_job_id` variable is defined.
+  # This variable is crucial as it tells the playbook which workflow to inspect.
+  # It's typically passed by AAP when this playbook is part of a workflow.
+  ansible.builtin.set_fact:
+    # `tower_workflow_job_id | default('')`:
+    # If `tower_workflow_job_id` is already defined (e.g., passed as an extra var by AAP),
+    # use its value. Otherwise, default to an empty string. This prevents errors if the
+    # variable is undefined, though a later task will check if it's properly set.
+    tower_workflow_job_id: "{{ tower_workflow_job_id | default('') }}"
+  delegate_to: localhost # Run this task on the AAP controller node.
+  run_once: true # Run this task only once, even if the playbook targets multiple hosts.
+
+- name: Validate workflow job ID is available # TASK 2
+  # Purpose: Stop the playbook if `tower_workflow_job_id` was not provided or is empty.
+  # Without this ID, the playbook cannot proceed as it won't know which workflow to analyze.
+  ansible.builtin.fail:
+    msg: "Workflow job ID (tower_workflow_job_id) is not defined. This playbook needs this ID to analyze a workflow."
+  when: tower_workflow_job_id | default('') == '' # Condition: If `tower_workflow_job_id` is an empty string.
+
+- name: Initialize variables for job analysis # TASK 3
+  # Purpose: Set up some internal variables that will be used later to store
+  # information about failed jobs and their outputs. Initializing them as empty
+  # lists or dictionaries ensures they are in a known state.
+  # The `_` prefix is a common convention for internal/temporary variables.
+  ansible.builtin.set_fact:
+    _failed_jobs: [] # Will store a list of jobs within the workflow that failed.
+    _all_jobs_info: {} # Will store detailed analysis for each failed job, keyed by job ID.
+    _stdout_by_job_id: {} # Will store the raw stdout content for each failed job, keyed by job ID.
+  delegate_to: localhost
+  run_once: true
+
+- name: Store initial wt_outcome value # TASK 4
+  # Purpose: Capture the current value of `wt_outcome` before this playbook modifies it.
+  # `wt_outcome` is likely used for communicating the overall status to an external system
+  # (e.g., ServiceNow). We only want to update it to 'COMPLETED' if it was initially
+  # in a non-terminal state like 'SCHEDULED' or 'IN_PROGRESS' and no failures are found.
+  ansible.builtin.set_fact:
+    _initial_wt_outcome: "{{ wt_outcome | default('SCHEDULED') }}" # Default to 'SCHEDULED' if not provided.
+  delegate_to: localhost
+  run_once: true
+
+- name: Fetch workflow nodes information # TASK 5
+  # Purpose: Make an API call to the AAP instance to get details about all
+  # individual jobs (called "workflow nodes") that are part of the specified workflow.
+  ansible.builtin.uri:
+    # url: Constructs the API endpoint.
+    # `lookup('env', 'TOWER_HOST')`: Retrieves the AAP API endpoint (e.g., https://my-aap.example.com).
+    # This environment variable is automatically populated by AAP when a 'Controller Credential'
+    # (or similar credential type providing TOWER_HOST, TOWER_USERNAME, TOWER_PASSWORD)
+    # is associated with the Job Template running this playbook.
+    # `tower_workflow_job_id`: The ID of the workflow we are inspecting.
+    url: "{{ lookup('env', 'TOWER_HOST') }}/api/v2/workflow_jobs/{{ tower_workflow_job_id }}/workflow_nodes/"
+    method: GET # HTTP GET request to retrieve data.
+    # url_username & url_password: Use AAP-provided environment variables for authentication.
+    # These are set from the associated 'Controller Credential'.
+    url_username: "{{ lookup('env', 'TOWER_USERNAME') }}"
+    url_password: "{{ lookup('env', 'TOWER_PASSWORD') }}"
+    force_basic_auth: yes # Ensures Basic Authentication is used.
+    # validate_certs: Determines if SSL certificates should be verified.
+    # `lookup('env', 'TOWER_VERIFY_SSL')`: Uses the AAP-provided environment variable.
+    # `default('true') | bool`: If TOWER_VERIFY_SSL is not set, default to 'true' (verify certs).
+    # The `| bool` filter converts the string 'true'/'false' to a boolean.
+    validate_certs: "{{ lookup('env', 'TOWER_VERIFY_SSL') | default('true') | bool }}"
+    return_content: yes # Return the body of the HTTP response.
+    status_code: [200] # Expect a successful HTTP 200 OK status.
+    timeout: 60 # Set a timeout for the API request (in seconds).
+  register: _workflow_nodes_result # Store the API response in this variable.
+  # Retry mechanism: If the API call fails (e.g., temporary network issue), retry up to 3 times with a 5-second delay.
+  retries: 3
+  delay: 5
+  until: _workflow_nodes_result is succeeded # Retry until the task succeeds (status_code is 200).
+  no_log: true # IMPORTANT: Prevents credentials or sensitive parts of the URL from being logged,
+               # especially if the `uri` module were to log them on failure or in verbose mode.
+  delegate_to: localhost
+  run_once: true
+
+- name: Extract failed jobs from workflow # TASK 6
+  # Purpose: Iterate through the list of workflow nodes (jobs) obtained from the API
+  # and identify any that have a status of "failed".
+  # For each failed job, it extracts its ID, name, and the workflow node ID.
+  ansible.builtin.set_fact:
+    # `_failed_jobs + [ ... ]`: Appends a new dictionary to the `_failed_jobs` list for each failed job found.
+    _failed_jobs: >-
+      {{ _failed_jobs + [
+          {
+            'job_id': item.summary_fields.job.id,       # The ID of the actual job template run.
+            'job_name': item.summary_fields.job.name,   # The name of the job template.
+            'node_id': item.id                          # The ID of this specific node in the workflow graph.
+          }
+        ]
+      }}
+  when:
+    # Conditions for considering a job as failed:
+    - item.summary_fields.job is defined # Ensure the job details exist.
+    - item.summary_fields.job.status is defined # Ensure the job status exists.
+    - item.summary_fields.job.status == "failed" # Check if the job status is exactly "failed".
+  # loop: Iterate over each item in the `results` list from the API response.
+  # `_workflow_nodes_result.json.results`: The API response is JSON; `.json` parses it,
+  # and `.results` accesses the list of workflow nodes.
+  loop: "{{ _workflow_nodes_result.json.results }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Display identified failed jobs # TASK 7
+  # Purpose: Print a message if any failed jobs were found. This is for informational
+  # purposes during the playbook run.
+  ansible.builtin.debug:
+    # `_failed_jobs | length`: Gets the number of items in the `_failed_jobs` list.
+    # `_failed_jobs | map(attribute='job_name') | list`: Extracts the 'job_name' from each
+    # dictionary in `_failed_jobs` and creates a new list of just the names.
+    msg: "Found {{ _failed_jobs | length }} failed jobs in the workflow: {{ _failed_jobs | map(attribute='job_name') | list }}"
+  when: _failed_jobs | length > 0 # Only run this task if there's at least one failed job.
+  delegate_to: localhost
+  run_once: true
+
+- name: Set wt_outcome to FAILED if workflow has failed jobs # TASK 8
+  # Purpose: If any jobs in the workflow failed, update the `wt_outcome` variable to "FAILED".
+  # This variable can then be used by external systems (e.g., ServiceNow callback) to know the result.
+  ansible.builtin.set_fact:
+    wt_outcome: "FAILED"
+    # `_failure_reason`: Provides a human-readable summary of which jobs failed.
+    _failure_reason: "Failed jobs detected in workflow: {{ _failed_jobs | map(attribute='job_name') | join(', ') }}"
+  when: _failed_jobs | length > 0 # Only run if there are failed jobs.
+  delegate_to: localhost
+  run_once: true
+
+- name: Set wt_outcome to COMPLETED if no failures detected # TASK 9
+  # Purpose: If no jobs in the workflow failed, and the initial state of `wt_outcome`
+  # was something like 'SCHEDULED' or 'IN_PROGRESS', update `wt_outcome` to "COMPLETED".
+  # This avoids overwriting a `wt_outcome` that might have already been set to 'FAILED' or
+  # 'CANCELLED' by a previous process.
+  ansible.builtin.set_fact:
+    wt_outcome: "COMPLETED"
+  when:
+    - _failed_jobs | length == 0 # Condition: No failed jobs were found.
+    - _initial_wt_outcome in ['SCHEDULED', 'IN_PROGRESS'] # Condition: The original `wt_outcome` was a non-terminal state.
+  delegate_to: localhost
+  run_once: true
+
+- name: Fetch job stdout for each failed job # TASK 10
+  # Purpose: For each job identified as "failed", make another API call to AAP
+  # to retrieve its standard output (stdout). The stdout contains the detailed log
+  # of what happened during that job's execution, including error messages.
+  ansible.builtin.uri:
+    # url: Constructs the API endpoint for fetching job stdout.
+    # `item.job_id`: This comes from the loop over `_failed_jobs`. Each `item` is a dictionary
+    #                containing `job_id`, `job_name`, etc., for a failed job.
+    # `format=txt...`: Parameters to get plain text stdout.
+    url: "{{ lookup('env', 'TOWER_HOST') }}/api/v2/jobs/{{ item.job_id }}/stdout/?format=txt&content_format=txt&content_encoding=plain"
+    method: GET
+    url_username: "{{ lookup('env', 'TOWER_USERNAME') }}"
+    url_password: "{{ lookup('env', 'TOWER_PASSWORD') }}"
+    force_basic_auth: yes
+    validate_certs: "{{ lookup('env', 'TOWER_VERIFY_SSL') | default('true') | bool }}"
+    return_content: yes # Crucial: we need the stdout content.
+    status_code: [200]
+    timeout: 60
+  register: "_job_stdout_results" # Stores results of all API calls (one per failed job).
+  loop: "{{ _failed_jobs }}" # Iterate over the list of failed jobs.
+  loop_control:
+    label: "{{ item.job_name }} (ID: {{ item.job_id }})" # Makes logs easier to read by labeling loop iterations.
+  no_log: true # Hide credentials and potentially verbose output from logs.
+  delegate_to: localhost
+  run_once: true # This task iterates internally, but the task definition itself runs once.
+  when: _failed_jobs | length > 0 # Only run if there are failed jobs to get stdout for.
+
+- name: Process job stdout results # TASK 11
+  # Purpose: Take the raw stdout content fetched in the previous task and store it
+  # in the `_stdout_by_job_id` dictionary. This dictionary will map each failed job's ID
+  # to its stdout content.
+  ansible.builtin.set_fact:
+    # `_stdout_by_job_id | default({}) | combine({item.item.job_id: item.content})`:
+    # - `_stdout_by_job_id | default({})`: Ensures `_stdout_by_job_id` is a dictionary.
+    # - `combine(...)`: Merges dictionaries. Here, it adds a new key-value pair.
+    # - `item.item.job_id`: When looping over results of a registered variable from a previous loop,
+    #                       the original loop item is accessed via `item.item`. So, this is the job_id.
+    # - `item.content`: This is the stdout content returned by the `uri` module for the current job.
+    _stdout_by_job_id: "{{ _stdout_by_job_id | default({}) | combine({item.item.job_id: item.content}) }}"
+  # loop: Iterate over the `results` list from the `_job_stdout_results` variable.
+  # Each `item` here corresponds to the result of one API call made in TASK 10.
+  loop: "{{ _job_stdout_results.results }}"
+  when:
+    - _failed_jobs | length > 0 # Only run if there were failed jobs.
+    - item.status == 200 # Only process if the stdout API call was successful (HTTP 200).
+                         # `item` here refers to an individual result from `_job_stdout_results.results`.
+  delegate_to: localhost
+  run_once: true
+
+- name: Process each failed job's stdout - Look for failures # TASK 12
+  # Purpose: Analyze the stdout of each failed job using regular expressions (regex)
+  # to find common Ansible failure patterns. This helps in extracting specific error messages.
+  ansible.builtin.set_fact:
+    # `_job_has_failures`: True if "fatal: ... FAILED!" is found in the stdout.
+    _job_has_failures: "{{ (_stdout_by_job_id[item.job_id] is regex('fatal:.*FAILED!')) }}"
+    # `_job_failed_task_count`: Counts how many times "fatal: ... FAILED!" appears.
+    _job_failed_task_count: "{{ _stdout_by_job_id[item.job_id] | regex_findall('fatal:.*FAILED!') | length }}"
+    # `_job_failure_lines`: Extracts lines related to failed tasks, including the task name and the fatal error message.
+    # `multiline=True` allows `.` to match newlines for `.*?` and `^` to match start of lines.
+    _job_failure_lines: "{{ _stdout_by_job_id[item.job_id] | regex_findall('TASK.*\\n.*?fatal:.*FAILED!.*=>.*', multiline=True) }}"
+    # `_job_play_recap`: Extracts the "PLAY RECAP" section, which summarizes failed hosts.
+    _job_play_recap: "{{ _stdout_by_job_id[item.job_id] | regex_findall('PLAY RECAP.*\\n.*', multiline=True) }}"
+    # `_job_failed_hosts`: Extracts hostnames that had failures from the PLAY RECAP section.
+    # `regex_findall('^(\S+)\s+:\s+.*?failed=[1-9]\d*.*$', multiline=True)`:
+    #   - `^(\S+)`: Captures the hostname (non-space characters at the start of a line).
+    #   - `\s+:\s+.*?`: Matches spaces, colon, spaces, then any characters non-greedily.
+    #   - `failed=[1-9]\d*`: Matches "failed=" followed by a non-zero number.
+    # `| unique`: Ensures each host is listed only once.
+    _job_failed_hosts: >-
+      {{
+        _stdout_by_job_id[item.job_id]
+        | regex_findall('^(\S+)\s+:\s+.*?failed=[1-9]\d*.*$', multiline=True)
+        | unique
+      }}
+    # `_job_final_error`: Tries to extract the "msg" from the first fatal error encountered.
+    # `regex_search('fatal:.*FAILED!.*=>.*\"msg\":.*\"([^\"]+)\"', '\\1', multiline=True)`:
+    #   - Searches for the pattern `fatal: ... FAILED! ... => ... "msg": "..."`.
+    #   - `([^\"]+)`: Captures the content inside the "msg" quotes. `\\1` refers to this captured group.
+    # `| default(...)`: If the regex doesn't find a match, provide a default message.
+    _job_final_error: "{{ _stdout_by_job_id[item.job_id] | regex_search('fatal:.*FAILED!.*=>.*\"msg\":.*\"([^\"]+)\"', '\\1', multiline=True) | default('Unknown error (Regex for msg extraction failed or no msg found)') }}"
+  loop: "{{ _failed_jobs }}" # Iterate over the list of failed jobs.
+  loop_control:
+    label: "{{ item.job_name }} (ID: {{ item.job_id }})"
+  when:
+    - _failed_jobs | length > 0 # Only run if there are failed jobs.
+    - item.job_id in _stdout_by_job_id # Ensure we have stdout for this specific job.
+  register: _job_analysis # Store the results of these fact settings for each job.
+  delegate_to: localhost
+  run_once: true # Task itself runs once, loop handles per-job processing.
+
+- name: Add job analysis to the all_jobs_info dictionary # TASK 13
+  # Purpose: Consolidate the analysis results (extracted error details) from the previous task
+  # into the `_all_jobs_info` dictionary. This dictionary will map each job ID to its analysis.
+  ansible.builtin.set_fact:
+    _all_jobs_info: >-
+      {{ _all_jobs_info | combine( # Merge with existing _all_jobs_info
+        { # Create a new entry for the current job_id
+          item.item.job_id: { # Key is the job ID (from original _failed_jobs loop item)
+            'job_name': item.item.job_name, # Job name
+            # Access facts set in the previous task (TASK 12), which were registered in _job_analysis.
+            # `item.ansible_facts._job_has_failures`: `item` here is from `_job_analysis.results`.
+            # `default(...)` is used for robustness in case a fact wasn't set.
+            'has_failures': item.ansible_facts._job_has_failures | default(false),
+            'failed_task_count': item.ansible_facts._job_failed_task_count | default(0),
+            'failure_lines': item.ansible_facts._job_failure_lines | default([]),
+            # Take only the first play recap if multiple are found (usually there's one).
+            'play_recap': (item.ansible_facts._job_play_recap | default([]) | first) if (item.ansible_facts._job_play_recap | default([])) else 'No play recap found',
+            'failed_hosts': item.ansible_facts._job_failed_hosts | default([]),
+            'final_error': item.ansible_facts._job_final_error | default('Unknown error')
+          }
+        }
+      ) }}
+  # loop: Iterate over the `results` from the `_job_analysis` variable.
+  # Each `item` contains the facts set for one job in TASK 12.
+  loop: "{{ _job_analysis.results }}"
+  when:
+    - _failed_jobs | length > 0 # Only run if there were failed jobs.
+    # `item is not skipped`: Ensure the corresponding iteration in TASK 12 was not skipped.
+    # `'ansible_facts' in item`: Ensure the facts were actually set and registered.
+    - item is not skipped and 'ansible_facts' in item
+  delegate_to: localhost
+  run_once: true
+
+- name: Extract detailed failure information for potential callback # TASK 14
+  # Purpose: Consolidate some high-level failure information.
+  # This might be useful for simple notifications or callbacks that don't need the full detail.
+  # `_failure_reason` is updated here to use the more specific error if available.
+  ansible.builtin.set_fact:
+    # `_failed_hosts_info`: Could be a list of failed job names, or more detailed host info if needed.
+    # Here, it's just a list of names of jobs that had failures.
+    _failed_hosts_info: "{{ _failed_jobs | map(attribute='job_name') | list }}"
+    # `_failure_reason`: Tries to get the `final_error` from the first analyzed job.
+    # If not available, it keeps the `_failure_reason` set in TASK 8.
+    _failure_reason: "{{ _all_jobs_info.values() | map(attribute='final_error') | first | default(_failure_reason) }}"
+  when:
+    - _failed_jobs | length > 0      # Only if there are failed jobs.
+    - _all_jobs_info | length > 0  # Only if analysis data is available.
+  delegate_to: localhost
+  run_once: true
+
+- name: Display job failure analyses # TASK 15
+  # Purpose: Print a summary of the analysis for each failed job. This is for logging and debugging.
+  ansible.builtin.debug:
+    msg: | # Using `|` for a multi-line message.
+      Job {{ _all_jobs_info[item.job_id].job_name }} (ID: {{ item.job_id }}) Analysis:
+      - Failed Tasks: {{ _all_jobs_info[item.job_id].failed_task_count }}
+      - Final Error: {{ _all_jobs_info[item.job_id].final_error }}
+  loop: "{{ _failed_jobs }}" # Iterate over the original list of failed jobs.
+  when:
+    - _failed_jobs | length > 0 # Only if there are failed jobs.
+    - item.job_id in _all_jobs_info # Ensure analysis exists for this job ID.
+  delegate_to: localhost
+  run_once: true
+
+- name: Aggregate all failure information # TASK 16
+  # Purpose: Create a final summary dictionary containing all relevant information
+  # about the workflow failures. This structured data can be easily used by other systems
+  # or logged.
+  ansible.builtin.set_fact:
+    workflow_failures_summary:
+      workflow_id: "{{ tower_workflow_job_id }}"
+      failed_jobs_count: "{{ _failed_jobs | length }}"
+      # `failed_jobs`: Contains the detailed analysis for each failed job,
+      #  taken from `_all_jobs_info`.
+      failed_jobs: "{{ _all_jobs_info }}"
+      # `final_wt_outcome`: The final calculated outcome for the workflow.
+      final_wt_outcome: "{{ wt_outcome }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Display workflow failures summary # TASK 17
+  # Purpose: Print the complete `workflow_failures_summary` dictionary.
+  # Useful for seeing the final aggregated data during playbook development or debugging.
+  ansible.builtin.debug:
+    var: workflow_failures_summary # Prints the entire variable.
+  delegate_to: localhost
+  run_once: true
+
+- name: Display final wt_outcome # TASK 18
+  # Purpose: Specifically display the `wt_outcome` value that will be available
+  # for external systems (like a ServiceNow API call that might follow this playbook).
+  ansible.builtin.debug:
+    msg: "Final wt_outcome for ServiceNow API (or other integration): {{ wt_outcome }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Set stats for later use # TASK 19
+  # Purpose: Make key pieces of information available as "Ansible stats".
+  # In AAP, stats set by `ansible.builtin.set_stats` can be accessed by subsequent
+  # job templates in a workflow or by features like Job Slice Output Processing,
+  # or by AAP's callback mechanism if configured.
+  # This is a clean way to pass structured data out of this playbook's execution.
+  ansible.builtin.set_stats:
+    data:
+      # The complete summary of workflow failures.
+      workflow_failures_summary: "{{ workflow_failures_summary }}"
+      # The final outcome status (e.g., "FAILED", "COMPLETED").
+      wt_outcome: "{{ wt_outcome }}"
+      # A unique list of all hosts that reported failures across all failed jobs.
+      # `_all_jobs_info.values()`: Get list of all job analysis dictionaries.
+      # `map(attribute='failed_hosts')`: Get the 'failed_hosts' list from each.
+      # `flatten`: Combines list of lists into a single list.
+      # `unique`: Removes duplicate hostnames.
+      _failed_hosts_info: "{{ _all_jobs_info.values() | map(attribute='failed_hosts') | flatten | unique | list }}"
+      # The primary reason for failure (could be the first error message found).
+      failure_reason: "{{ _failure_reason | default('') }}"
+  delegate_to: localhost
+  run_once: true
